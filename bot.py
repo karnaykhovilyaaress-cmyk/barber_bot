@@ -61,7 +61,7 @@ def init_db():
             client_id INTEGER, service_id INTEGER,
             service_name TEXT, price_paid INTEGER, 
             date TEXT, start_time TEXT, end_time TEXT, 
-            status TEXT DEFAULT 'active', -- active, completed, no_show, cancelled
+            status TEXT DEFAULT 'active',
             comment TEXT DEFAULT '',
             FOREIGN KEY(client_id) REFERENCES clients(id)
         );
@@ -297,7 +297,9 @@ async def cb_client_cal_nav(callback: CallbackQuery):
     except: pass
     await callback.answer()
 
-@dp.callback_query((ClientState.date_choice | ClientState.calendar), F.data.startswith("cli_date_"))
+# ИСПРАВЛЕНИЕ ОШИБКИ: два декоратора вместо |
+@dp.callback_query(ClientState.date_choice, F.data.startswith("cli_date_"))
+@dp.callback_query(ClientState.calendar, F.data.startswith("cli_date_"))
 async def cb_client_date_selected(callback: CallbackQuery, state: FSMContext):
     date_str = callback.data.split("_")[2]
     data = await state.get_data()
@@ -369,7 +371,8 @@ async def process_client_phone(message: Message, state: FSMContext):
     await state.update_data(phone=phone)
     await message.answer("Данные сохранены.", reply_markup=ReplyKeyboardRemove())
     
-    await safe_edit(message, "Введите Промокод (если есть) или нажмите 'Пропустить':", 
+    # ИСПРАВЛЕНИЕ: используем message.answer, так как message - это сообщение пользователя
+    await message.answer("Введите Промокод (если есть) или нажмите 'Пропустить':", 
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Пропустить", callback_data="cli_skip_promo")]]))
     await state.set_state(ClientState.promo)
 
@@ -637,7 +640,9 @@ async def admin_booking_details(callback: CallbackQuery):
     await safe_edit(callback.message, f"Запись: {b['client_name']}\nТел: {b['client_phone']}\nУслуга: {b['service_name']}\nВремя: {b['start_time']}–{b['end_time']}", reply_markup=kb)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("adm_done_") | F.data.startswith("adm_miss_"))
+# ИСПРАВЛЕНИЕ ОШИБКИ: два декоратора вместо |
+@dp.callback_query(F.data.startswith("adm_done_"))
+@dp.callback_query(F.data.startswith("adm_miss_"))
 async def admin_mark_visit(callback: CallbackQuery):
     parts = callback.data.split("_")
     with get_db() as conn: conn.execute("UPDATE bookings SET status=? WHERE id=?", ('completed' if parts[1] == 'done' else 'no_show', int(parts[2])))
