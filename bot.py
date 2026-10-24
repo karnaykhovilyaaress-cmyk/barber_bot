@@ -19,6 +19,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "username") # Юзернейм без @
 BARBER_NAME = os.getenv("BARBER_NAME", "Мастер")
 BARBER_ADDRESS = os.getenv("BARBER_ADDRESS", "ул. Пушкина, д. 1")
 
@@ -41,35 +42,28 @@ SERVICES = {
 
 BOOKINGS = {}
 booking_counter = 0
+SLOTS = {}
 
-def generate_slots_30_days():
-    """Генерирует слоты на 30 дней вперед"""
-    today = datetime.now()
-    slots = {}
-    base_times = ["10:00", "11:30", "13:00", "15:00", "16:30", "18:00"]
-    for i in range(30):
-        date = (today + timedelta(days=i)).strftime("%d.%m.%Y")
-        slots[date] = base_times.copy()
-    return slots
-
-# Загружаем базу из файла или создаем новую
-if os.path.exists(BOOKINGS_FILE):
-    with open(BOOKINGS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        BOOKINGS = {int(k): v for k, v in data.get("bookings", {}).items()}
-        booking_counter = data.get("counter", 0)
-
-if os.path.exists(SLOTS_FILE):
-    with open(SLOTS_FILE, "r", encoding="utf-8") as f:
-        SLOTS = json.load(f)
-else:
-    SLOTS = generate_slots_30_days()
+def load_data():
+    global BOOKINGS, booking_counter, SLOTS
+    if os.path.exists(BOOKINGS_FILE):
+        with open(BOOKINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            BOOKINGS = {int(k): v for k, v in data.get("bookings", {}).items()}
+            booking_counter = data.get("counter", 0)
+    
+    if os.path.exists(SLOTS_FILE):
+        with open(SLOTS_FILE, "r", encoding="utf-8") as f:
+            SLOTS = json.load(f)
 
 def save_data():
     with open(BOOKINGS_FILE, "w", encoding="utf-8") as f:
         json.dump({"bookings": BOOKINGS, "counter": booking_counter}, f, ensure_ascii=False, indent=2)
     with open(SLOTS_FILE, "w", encoding="utf-8") as f:
         json.dump(SLOTS, f, ensure_ascii=False, indent=2)
+
+# Загружаем при старте
+load_data()
 
 # --- КЛАВИАТУРЫ ---
 def main_menu():
@@ -81,8 +75,16 @@ def main_menu():
 
 def admin_menu():
     kb = [
-        [KeyboardButton(text="Посмотреть все записи")],
-        [KeyboardButton(text="Показать /backup /restore инструкции")]
+        [KeyboardButton(text="Все записи"), KeyboardButton(text="Управление слотами")],
+        [KeyboardButton(text="Инструкции /backup /restore")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def admin_slots_menu():
+    kb = [
+        [KeyboardButton(text="Добавить дату"), KeyboardButton(text="Добавить время")],
+        [KeyboardButton(text="Удалить дату"), KeyboardButton(text="Показать расписание")],
+        [KeyboardButton(text="Назад в админку")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -95,7 +97,13 @@ class BookingState(StatesGroup):
     entering_phone = State()
     confirming = State()
 
-# --- ХЭНДЛЕРЫ ---
+class AdminState(StatesGroup):
+    add_date = State()
+    add_time_date = State()
+    add_time_value = State()
+    delete_date = State()
+
+# --- ХЭНДЛЕРЫ КЛИЕНТА ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -121,7 +129,7 @@ async def faq_handler(message: Message):
         f"- Стрижка + Борода: 2000 руб.\n"
         f"- Бритье опасной бритвой: 1200 руб.\n\n"
         "Подготовка: Приходите за 5-10 минут до назначенного времени.\n\n"
-        "Связаться с нами: напишите в этот бот."
+        f"Связаться с мастером: @{ADMIN_USERNAME}"
     )
     await message.answer(text)
 
@@ -143,13 +151,18 @@ async def process_service(callback: CallbackQuery, state: FSMContext):
     service_key = callback.data.split("_")[1]
     await state.update_data(service_key=service_key)
     
-    # Показываем даты на 7 дней вперед для удобства (чтобы не листать 30 дней)
+    available_dates = [d for d, times in SLOTS.items() if times]
+    if not available_dates:
+        await callback.message.answer("Пока нет доступных дат для записи. Свяжитесь с мастером.")
+        await state.clear()
+        await callback.answer()
+        return
+
     buttons = []
-    dates = list(SLOTS.keys())[:7] # Берем первые 7 дней
-    for date in dates:
+    for date in available_dates[:10]: # Показываем до 10 доступных дат
         buttons.append([InlineKeyboardButton(text=date, callback_data=f"date_{date}")])
     
-    await callback.message.edit_text("Выберите дату (ближайшие 7 дней):", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.answer("Выберите дату:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await state.set_state(BookingState.choosing_date)
     await callback.answer()
 
@@ -163,7 +176,7 @@ async def process_date(callback: CallbackQuery, state: FSMContext):
     available_times = [t for t in available_times if t not in booked_times]
     
     if not available_times:
-        await callback.message.edit_text(f"На {date} нет свободных слотов.")
+        await callback.message.answer(f"На {date} нет свободных слотов. Выберите другую дату.")
         await state.set_state(BookingState.choosing_date)
         await callback.answer()
         return
@@ -172,7 +185,7 @@ async def process_date(callback: CallbackQuery, state: FSMContext):
     for time in available_times:
         buttons.append([InlineKeyboardButton(text=time, callback_data=f"time_{time}")])
     
-    await callback.message.edit_text("Выберите время:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.answer("Выберите время:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await state.set_state(BookingState.choosing_time)
     await callback.answer()
 
@@ -181,7 +194,7 @@ async def process_time(callback: CallbackQuery, state: FSMContext):
     time = callback.data.split("_")[1]
     await state.update_data(time=time)
     
-    await callback.message.edit_text("Введите ваше имя:")
+    await callback.message.answer("Введите ваше имя:")
     await state.set_state(BookingState.entering_name)
     await callback.answer()
 
@@ -236,17 +249,21 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext):
         booking_id = booking_counter
         srv = SERVICES[data['service_key']]
         
+        username = f"@{callback.from_user.username}" if callback.from_user.username else f"ID: {callback.from_user.id}"
+        
         BOOKINGS[booking_id] = {
             "user_id": callback.from_user.id,
+            "username": username,
             "name": data['name'],
             "phone": data['phone'],
             "service": srv['name'],
             "date": data['date'],
-            "time": data['time']
+            "time": data['time'],
+            "reminded": False # Флаг для уведомления
         }
-        save_data() # Сохраняем в файл
+        save_data()
         
-        await callback.message.edit_text(
+        await callback.message.answer(
             f"Вы успешно записаны.\n\n"
             f"Услуга: {srv['name']}\n"
             f"Дата: {data['date']} в {data['time']}\n"
@@ -258,9 +275,9 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext):
             f"НОВАЯ ЗАПИСЬ #{booking_id}\n\n"
             f"Клиент: {data['name']}\n"
             f"Телефон: {data['phone']}\n"
+            f"Telegram: {username}\n"
             f"Услуга: {srv['name']}\n"
-            f"Время: {data['date']} в {data['time']}\n"
-            f"TG ID: {callback.from_user.id}"
+            f"Время: {data['date']} в {data['time']}"
         )
         try:
             await bot.send_message(ADMIN_ID, admin_text)
@@ -268,7 +285,7 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext):
             logging.error(f"Ошибка отправки админу: {e}")
             
     else:
-        await callback.message.edit_text("Запись отменена.")
+        await callback.message.answer("Запись отменена.")
         await callback.message.answer("Главное меню:", reply_markup=main_menu())
     
     await state.clear()
@@ -305,13 +322,14 @@ async def process_cancel(callback: CallbackQuery):
     booking_id = int(callback.data.split("_")[1])
     if booking_id in BOOKINGS:
         b = BOOKINGS.pop(booking_id)
-        save_data() # Сохраняем изменения
-        await callback.message.edit_text("Запись отменена.")
+        save_data()
+        await callback.message.answer("Запись отменена.")
         
         admin_text = (
             f"КЛИЕНТ ОТМЕНИЛ ЗАПИСЬ #{booking_id}\n\n"
             f"Клиент: {b['name']}\n"
             f"Телефон: {b['phone']}\n"
+            f"Telegram: {b.get('username', '')}\n"
             f"Услуга: {b['service']}\n"
             f"Время: {b['date']} в {b['time']}"
         )
@@ -320,10 +338,11 @@ async def process_cancel(callback: CallbackQuery):
         except Exception as e:
             logging.error(f"Ошибка отправки админу: {e}")
     else:
-        await callback.message.edit_text("Запись не найдена.")
+        await callback.message.answer("Запись не найдена.")
 
 # --- АДМИН ПАНЕЛЬ ---
-@dp.message(F.text == "Посмотреть все записи")
+
+@dp.message(F.text == "Все записи")
 async def admin_view_bookings(message: Message):
     if message.from_user.id != ADMIN_ID: return
     
@@ -337,51 +356,160 @@ async def admin_view_bookings(message: Message):
             f"#{b_id} - {b['date']} в {b['time']}\n"
             f"Услуга: {b['service']}\n"
             f"Клиент: {b['name']}, тел: {b['phone']}\n"
-            f"TG ID: {b['user_id']}\n\n"
+            f"Telegram: {b.get('username', 'скрыт')}\n\n"
         )
     await message.answer(text)
 
-@dp.message(F.text == "Показать /backup /restore инструкции")
+@dp.message(F.text == "Управление слотами")
+async def admin_slots(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer("Управление расписанием:", reply_markup=admin_slots_menu())
+
+@dp.message(F.text == "Назад в админку")
+async def admin_back(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Возврат в админку.", reply_markup=admin_menu())
+
+@dp.message(F.text == "Показать расписание")
+async def admin_show_slots(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    if not SLOTS:
+        await message.answer("Расписание пусто.")
+        return
+    
+    text = "Текущее расписание:\n\n"
+    for date, times in list(SLOTS.items())[:15]:
+        booked = [b["time"] for b in BOOKINGS.values() if b["date"] == date]
+        free_times = [t for t in times if t not in booked]
+        text += f"{date}: {', '.join(free_times) if free_times else 'все занято'}\n"
+    
+    await message.answer(text)
+
+@dp.message(F.text == "Добавить дату")
+async def admin_add_date_start(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer("Введите дату в формате ДД.ММ.ГГГГ (например, 25.10.2026):")
+    await state.set_state(AdminState.add_date)
+
+@dp.message(AdminState.add_date)
+async def admin_add_date_process(message: Message, state: FSMContext):
+    date_str = message.text.strip()
+    try:
+        datetime.strptime(date_str, "%d.%m.%Y")
+    except ValueError:
+        await message.answer("Неверный формат. Введите ДД.ММ.ГГГГ:")
+        return
+        
+    if date_str not in SLOTS:
+        SLOTS[date_str] = []
+        save_data()
+    
+    await message.answer(f"Дата {date_str} добавлена. Теперь добавьте время для этой даты.", reply_markup=admin_slots_menu())
+    await state.update_data(target_date=date_str)
+    await state.set_state(AdminState.add_time_value)
+
+@dp.message(F.text == "Добавить время")
+async def admin_add_time_start(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer("Введите дату, для которой добавляете время (ДД.ММ.ГГГГ):")
+    await state.set_state(AdminState.add_time_date)
+
+@dp.message(AdminState.add_time_date)
+async def admin_add_time_date(message: Message, state: FSMContext):
+    date_str = message.text.strip()
+    try:
+        datetime.strptime(date_str, "%d.%m.%Y")
+    except ValueError:
+        await message.answer("Неверный формат. Введите ДД.ММ.ГГГГ:")
+        return
+    
+    if date_str not in SLOTS:
+        SLOTS[date_str] = []
+        
+    await message.answer("Введите время в формате ЧЧ:ММ (например, 14:30):")
+    await state.update_data(target_date=date_str)
+    await state.set_state(AdminState.add_time_value)
+
+@dp.message(AdminState.add_time_value)
+async def admin_add_time_value(message: Message, state: FSMContext):
+    time_str = message.text.strip()
+    try:
+        datetime.strptime(time_str, "%H:%M")
+    except ValueError:
+        await message.answer("Неверный формат. Введите ЧЧ:ММ:")
+        return
+        
+    data = await state.get_data()
+    date_str = data.get("target_date")
+    
+    if date_str in SLOTS:
+        if time_str not in SLOTS[date_str]:
+            SLOTS[date_str].append(time_str)
+            SLOTS[date_str].sort()
+            save_data()
+            await message.answer(f"Время {time_str} добавлено на {date_str}.", reply_markup=admin_slots_menu())
+        else:
+            await message.answer(f"Время {time_str} уже есть на {date_str}.", reply_markup=admin_slots_menu())
+    
+    await state.clear()
+
+@dp.message(F.text == "Удалить дату")
+async def admin_del_date_start(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer("Введите дату для удаления (ДД.ММ.ГГГГ):")
+    await state.set_state(AdminState.delete_date)
+
+@dp.message(AdminState.delete_date)
+async def admin_del_date_process(message: Message, state: FSMContext):
+    date_str = message.text.strip()
+    if date_str in SLOTS:
+        del SLOTS[date_str]
+        # Удаляем записи на эту дату
+        for b_id in list(BOOKINGS.keys()):
+            if BOOKINGS[b_id]["date"] == date_str:
+                del BOOKINGS[b_id]
+        save_data()
+        await message.answer(f"Дата {date_str} и все записи на нее удалены.", reply_markup=admin_slots_menu())
+    else:
+        await message.answer(f"Дата {date_str} не найдена.", reply_markup=admin_slots_menu())
+    
+    await state.clear()
+
+@dp.message(F.text == "Инструкции /backup /restore")
 async def admin_backup_instructions(message: Message):
     if message.from_user.id != ADMIN_ID: return
     await message.answer(
         "Сохранение данных:\n\n"
-        "Команда /backup пришлет вам файл с базой записей и слотами (bookings.json, slots.json) в архиве.\n\n"
-        "Команда /restore используется для восстановления. Просто отправьте боту архив с базой (с подписью /restore), и он заменит текущие данные."
+        "Команда /backup пришлет вам архив с файлами базы.\n\n"
+        "Команда /restore используется для восстановления. Просто отправьте боту архив с подписью /restore, и он заменит текущие данные."
     )
 
 # --- КОМАНДЫ БЭКАПА ---
 @dp.message(Command("backup"))
 async def cmd_backup(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
+    if message.from_user.id != ADMIN_ID: return
     try:
         import zipfile
         zip_path = "backup_data.zip"
         with zipfile.ZipFile(zip_path, "w") as z:
-            if os.path.exists(BOOKINGS_FILE):
-                z.write(BOOKINGS_FILE)
-            if os.path.exists(SLOTS_FILE):
-                z.write(SLOTS_FILE)
+            if os.path.exists(BOOKINGS_FILE): z.write(BOOKINGS_FILE)
+            if os.path.exists(SLOTS_FILE): z.write(SLOTS_FILE)
         
         doc = FSInputFile(zip_path, filename="barber_backup.zip")
-        await message.answer_document(doc, caption="Резервная копия базы данных.")
+        await message.answer_document(doc, caption="Резервная копия.")
         os.remove(zip_path)
     except Exception as e:
         await message.answer(f"Ошибка бэкапа: {e}")
 
 @dp.message(Command("restore"))
 async def cmd_restore(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("Отправьте архив с базой (zip), в подписи к файлу укажите /restore.")
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer("Отправьте архив (zip) с базой, указав в подписи /restore.")
 
 @dp.message(F.document)
 async def process_restore_doc(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    if not message.caption or "/restore" not in message.caption:
-        return
+    if message.from_user.id != ADMIN_ID: return
+    if not message.caption or "/restore" not in message.caption: return
         
     try:
         import zipfile
@@ -392,25 +520,41 @@ async def process_restore_doc(message: Message):
         with zipfile.ZipFile(tmp_path, "r") as z:
             z.extractall()
         
-        global BOOKINGS, booking_counter, SLOTS
-        if os.path.exists(BOOKINGS_FILE):
-            with open(BOOKINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                BOOKINGS = {int(k): v for k, v in data.get("bookings", {}).items()}
-                booking_counter = data.get("counter", 0)
-        
-        if os.path.exists(SLOTS_FILE):
-            with open(SLOTS_FILE, "r", encoding="utf-8") as f:
-                SLOTS = json.load(f)
-                
+        load_data() # Перезагружаем данные из восстановленных файлов
         os.remove(tmp_path)
         await message.answer("База данных успешно восстановлена.")
     except Exception as e:
         await message.answer(f"Ошибка восстановления: {e}")
 
+# --- УВЕДОМЛЕНИЯ ЗА ДЕНЬ ---
+async def reminder_worker():
+    """Фоновая задача: проверяет записи и шлет напоминания за 24 часа."""
+    while True:
+        try:
+            now = datetime.now()
+            tomorrow = (now + timedelta(days=1)).strftime("%d.%m.%Y")
+            
+            for b_id, b in list(BOOKINGS.items()):
+                if b["date"] == tomorrow and not b.get("reminded", False):
+                    try:
+                        text = (
+                            f"Напоминание о записи.\n\n"
+                            f"Завтра в {b['time']} у вас запись на услугу: {b['service']}.\n"
+                            f"Мастер: {BARBER_NAME}\n"
+                            f"Адрес: {BARBER_ADDRESS}"
+                        )
+                        await bot.send_message(b["user_id"], text)
+                        BOOKINGS[b_id]["reminded"] = True
+                        save_data()
+                    except Exception as e:
+                        logging.warning(f"Не удалось отправить напоминание {b['user_id']}: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка в reminder_worker: {e}")
+            
+        await asyncio.sleep(1800) # Проверка каждые 30 минут
+
 # --- ЗАПУСК ---
 async def start_web_server():
-    """Мини-сервер для BotHost, чтобы он видел, что бот работает"""
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app)
@@ -422,6 +566,7 @@ async def start_web_server():
 
 async def main():
     asyncio.create_task(start_web_server())
+    asyncio.create_task(reminder_worker()) # Запуск напоминаний
     logging.info("Бот запускается...")
     await dp.start_polling(bot)
 
