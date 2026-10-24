@@ -21,6 +21,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "username")
+# Добавлено имя барбера
+BARBER_NAME = os.getenv("BARBER_NAME", "Александр")
 BARBER_ADDRESS = os.getenv("BARBER_ADDRESS", "ул. Пушкина, д. 1")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -41,13 +43,17 @@ def init_db():
     with get_db() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS services (
-            id INTEGER PRIMARY KEY, name TEXT, description TEXT, 
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, description TEXT, 
             duration INTEGER, price INTEGER, is_active INTEGER DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, client_name TEXT, client_phone TEXT,
             service_id INTEGER, date TEXT, start_time TEXT, end_time TEXT, 
-            status TEXT DEFAULT 'active', discount INTEGER DEFAULT 0, price_paid INTEGER DEFAULT 0
+            status TEXT DEFAULT 'active', discount INTEGER DEFAULT 0
+        );
+        -- Таблица графика работы
+        CREATE TABLE IF NOT EXISTS schedule (
+            date TEXT PRIMARY KEY, start_time TEXT, end_time TEXT, is_working INTEGER DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS time_blocks (
             id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, start_time TEXT, end_time TEXT
@@ -62,14 +68,13 @@ def init_db():
         if not conn.execute("SELECT 1 FROM services").fetchone():
             conn.executemany("INSERT INTO services (name, description, duration, price) VALUES (?, ?, ?, ?)",
                 [("Стрижка волос", "Классическая или модельная стрижка.", 45, 1500), 
-                 ("Стрижка бороды", "Оформление бороды и усов.", 30, 800), 
-                 ("Комплекс", "Стрижка головы и бороды.", 75, 2000)])
+                 ("Стрижка бороды", "Оформление бороды и усов.", 30, 800)])
 
 init_db()
 
-WORK_START = dt_time(10, 0)
-WORK_END = dt_time(20, 0)
-
+# ==========================================
+# 2. УТИЛИТЫ И ЛОГИКА ВРЕМЕНИ
+# ==========================================
 def time_to_min(t_str):
     h, m = map(int, t_str.split(':'))
     return h * 60 + m
@@ -78,9 +83,7 @@ def min_to_time(m):
     return f"{m // 60:02d}:{m % 60:02d}"
 
 def validate_time(t_str):
-    if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", t_str):
-        return False
-    return True
+    return bool(re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", t_str))
 
 def validate_date(d_str):
     try:
@@ -90,6 +93,16 @@ def validate_date(d_str):
         return False
 
 def get_available_slots(date_str, duration):
+    # Проверяем график работы на этот день
+    with get_db() as conn:
+        sched = conn.execute("SELECT start_time, end_time, is_working FROM schedule WHERE date=?", (date_str,)).fetchone()
+        
+    if not sched or sched['is_working'] == 0:
+        return [] # Выходной или график не задан
+
+    work_start = time_to_min(sched['start_time'])
+    work_end = time_to_min(sched['end_time'])
+
     with get_db() as conn:
         bookings = conn.execute("SELECT start_time, end_time FROM bookings WHERE date=? AND status='active'", (date_str,)).fetchall()
         blocks = conn.execute("SELECT start_time, end_time FROM time_blocks WHERE date=?", (date_str,)).fetchall()
@@ -99,10 +112,9 @@ def get_available_slots(date_str, duration):
     busy_intervals.sort()
     
     available = []
-    curr_time = time_to_min(WORK_START.strftime("%H:%M"))
-    end_work = time_to_min(WORK_END.strftime("%H:%M"))
+    curr_time = work_start
     
-    while curr_time + duration <= end_work:
+    while curr_time + duration <= work_end:
         slot_start = curr_time
         slot_end = curr_time + duration
         overlap = False
@@ -132,8 +144,7 @@ def create_calendar(year, month):
             else:
                 date_obj = datetime(year, month, day).date()
                 if date_obj < today:
-                    # Прошедшие даты неактивны
-                    row.append(InlineKeyboardButton(text=f"·", callback_data="ignore"))
+                    row.append(InlineKeyboardButton(text="·", callback_data="ignore"))
                 else:
                     row.append(InlineKeyboardButton(text=str(day), callback_data=f"date_{day:02d}.{month:02d}.{year}"))
         kb.append(row)
@@ -152,7 +163,7 @@ async def safe_edit(message: Message, text: str, reply_markup=None):
         pass
 
 # ==========================================
-# 2. КЛАВИАТУРЫ
+# 3. КЛАВИАТУРЫ
 # ==========================================
 def get_client_reply_kb():
     return ReplyKeyboardMarkup(keyboard=[
@@ -163,19 +174,19 @@ def get_client_reply_kb():
 def get_admin_reply_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="На сегодня"), KeyboardButton(text="Ручная запись")],
+        [KeyboardButton(text="График работы"), KeyboardButton(text="Услуги")],
         [KeyboardButton(text="Клиенты"), KeyboardButton(text="Настройки")]
     ], resize_keyboard=True)
 
 def get_admin_inline_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Управление услугами", callback_data="admin_services")],
-        [InlineKeyboardButton(text="Статистика выручки", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="Промокоды и Рассылка", callback_data="admin_settings")],
-        [InlineKeyboardButton(text="Блокировка времени", callback_data="admin_block")]
+        [InlineKeyboardButton(text="Промокоды", callback_data="admin_new_promo")],
+        [InlineKeyboardButton(text="Рассылка клиентам", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="Закрыть", callback_data="cancel_action")]
     ])
 
 # ==========================================
-# 3. СОСТОЯНИЯ
+# 4. СОСТОЯНИЯ
 # ==========================================
 class ClientState(StatesGroup):
     service = State(); calendar = State(); time = State()
@@ -183,16 +194,22 @@ class ClientState(StatesGroup):
     promo = State(); reschedule_id = State()
 
 class AdminState(StatesGroup):
+    # Ручная запись
     manual_name = State(); manual_phone = State(); manual_service = State()
     manual_date = State(); manual_time = State()
+    # График
+    gen_month = State(); custom_date = State(); custom_start = State(); custom_end = State()
+    # Блокировка
     block_date = State(); block_start = State(); block_end = State()
-    service_name = State(); service_desc = State(); service_duration = State(); service_price = State()
-    promo_code = State(); promo_discount = State()
-    broadcast_text = State()
+    # Услуги
+    srv_name = State(); srv_desc = State(); srv_dur = State(); srv_price = State()
+    edit_srv_name = State(); edit_srv_desc = State(); edit_srv_dur = State(); edit_srv_price = State()
+    # Настройки
+    promo_code = State(); promo_discount = State(); broadcast_text = State()
     add_note = State()
 
 # ==========================================
-# 4. БАЗОВЫЕ ХЭНДЛЕРЫ
+# 5. БАЗОВЫЕ ХЭНДЛЕРЫ
 # ==========================================
 @dp.callback_query(F.data == "ignore")
 async def cb_ignore(callback: CallbackQuery):
@@ -208,18 +225,20 @@ async def cb_cancel_action(callback: CallbackQuery, state: FSMContext):
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     if message.from_user.id == ADMIN_ID:
-        await message.answer("Панель управления барбера.", reply_markup=get_admin_reply_kb())
+        await message.answer(f"Панель управления ({BARBER_NAME}).", reply_markup=get_admin_reply_kb())
     else:
-        await message.answer("Здравствуйте! Выберите действие на клавиатуре ниже.", reply_markup=get_client_reply_kb())
+        await message.answer(f"Здравствуйте! Вы в боте записи к мастеру {BARBER_NAME}.\nВыберите действие:", reply_markup=get_client_reply_kb())
 
 # ==========================================
-# 5. КЛИЕНТ: ЗАПИСЬ
+# 6. КЛИЕНТ: ЗАПИСЬ
 # ==========================================
 @dp.message(F.text == "Записаться")
 async def msg_book_start(message: Message, state: FSMContext):
     if message.from_user.id == ADMIN_ID: return await message.answer("Вы админ.")
     await state.clear()
     with get_db() as conn: services = conn.execute("SELECT * FROM services WHERE is_active=1").fetchall()
+    if not services: return await message.answer("Пока нет доступных услуг.")
+    
     kb = [[InlineKeyboardButton(text=f"{s['name']} ({s['duration']} мин) - {s['price']}р", callback_data=f"srv_{s['id']}")] for s in services]
     kb.append([InlineKeyboardButton(text="Отмена", callback_data="cancel_action")])
     await message.answer("Выберите услугу:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
@@ -251,8 +270,9 @@ async def cb_date(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     with get_db() as conn: srv = conn.execute("SELECT duration FROM services WHERE id=?", (data['srv_id'],)).fetchone()
     slots = get_available_slots(date_str, srv['duration'])
+    
     if not slots: 
-        await callback.answer("На эту дату нет свободного времени.", show_alert=True)
+        await callback.answer("В этот день мастер не работает или нет мест.", show_alert=True)
         return
     kb = []
     row = []
@@ -347,11 +367,11 @@ async def finalize_booking(message_obj, state: FSMContext, client_id=None, is_re
                          (data['date'], data['time'], end_time, data['reschedule_id']))
             msg_text = "Запись успешно перенесена!"
         else:
-            cur = conn.execute("INSERT INTO bookings (client_id, client_name, client_phone, service_id, date, start_time, end_time, discount, price_paid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                         (client_id, data.get('name', 'Клиент'), data.get('phone', ''), srv['id'], data['date'], data['time'], end_time, data.get('total_discount', 0), data.get('final_price', srv['price'])))
+            cur = conn.execute("INSERT INTO bookings (client_id, client_name, client_phone, service_id, date, start_time, end_time, discount) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                         (client_id, data.get('name', 'Клиент'), data.get('phone', ''), srv['id'], data['date'], data['time'], end_time, data.get('total_discount', 0)))
             b_id = cur.lastrowid
             msg_text = f"Вы успешно записаны!\n\nЖдем вас {data['date']} в {data['time']}.\nАдрес: {BARBER_ADDRESS}"
-            admin_text = f"НОВАЯ ЗАПИСЬ #{b_id}\n{data.get('name', 'Клиент')}\nТел: {data.get('phone', '')}\n{srv['name']} - {data['date']} в {data['time']}"
+            admin_text = f"НОВАЯ ЗАПИСЬ #{b_id}\n{data.get('name')}\nТел: {data.get('phone')}\n{srv['name']} - {data['date']} в {data['time']}"
             try: await bot.send_message(ADMIN_ID, admin_text)
             except: pass
             
@@ -360,7 +380,7 @@ async def finalize_booking(message_obj, state: FSMContext, client_id=None, is_re
     await state.clear()
 
 # ==========================================
-# 6. КЛИЕНТ: МОИ ЗАПИСИ
+# 7. КЛИЕНТ: МОИ ЗАПИСИ
 # ==========================================
 @dp.message(F.text == "Мои записи")
 async def msg_my_bookings(message: Message):
@@ -416,11 +436,221 @@ async def cb_cancel(callback: CallbackQuery):
 
 @dp.message(F.text == "О нас")
 async def msg_faq(message: Message):
-    text = f"Барбер: @{ADMIN_USERNAME}\nАдрес: {BARBER_ADDRESS}\nРаботаем: 10:00 - 20:00\n\nПравила отмены: не позднее чем за 2 часа до визита.\nСвязь: @{ADMIN_USERNAME}"
+    text = f"Мастер: {BARBER_NAME}\nTelegram для связи: @{ADMIN_USERNAME}\nАдрес: {BARBER_ADDRESS}\n\nПравила отмены: не позднее чем за 2 часа до визита."
     await message.answer(text)
 
 # ==========================================
-# 7. АДМИН ПАНЕЛЬ
+# 8. АДМИН: ГРАФИК РАБОТЫ
+# ==========================================
+@dp.message(F.text == "График работы")
+async def msg_admin_schedule(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сгенерировать месяц", callback_data="gen_month")],
+        [InlineKeyboardButton(text="Настроить конкретный день", callback_data="custom_day")],
+        [InlineKeyboardButton(text="Закрыть", callback_data="cancel_action")]
+    ])
+    await message.answer("Управление графиком. По умолчанию дней нет, клиенты не смогут записаться, пока вы не откроете дни.", reply_markup=kb)
+
+@dp.callback_query(F.data == "gen_month")
+async def cb_gen_month(callback: CallbackQuery, state: FSMContext):
+    await safe_edit(callback.message, "Введите месяц и год для генерации (ММ.ГГГГ, например 11.2026):\n\nБудут открыты все дни с 10:00 до 20:00.")
+    await state.set_state(AdminState.gen_month)
+    await callback.answer()
+
+@dp.message(AdminState.gen_month)
+async def process_gen_month(message: Message, state: FSMContext):
+    try:
+        dt = datetime.strptime(message.text.strip(), "%m.%Y")
+    except ValueError:
+        return await message.answer("Неверный формат. Введите ММ.ГГГГ:")
+    
+    year, month = dt.year, dt.month
+    num_days = calendar.monthrange(year, month)[1]
+    added = 0
+    with get_db() as conn:
+        for day in range(1, num_days + 1):
+            date_str = f"{day:02d}.{month:02d}.{year}"
+            # Добавляем только если дня еще нет в базе
+            if not conn.execute("SELECT 1 FROM schedule WHERE date=?", (date_str,)).fetchone():
+                conn.execute("INSERT INTO schedule (date, start_time, end_time, is_working) VALUES (?, '10:00', '20:00', 1)", (date_str,))
+                added += 1
+    await message.answer(f"График на {message.text} создан. Открыто дней: {added}.", reply_markup=get_admin_reply_kb())
+    await state.clear()
+
+@dp.callback_query(F.data == "custom_day")
+async def cb_custom_day(callback: CallbackQuery, state: FSMContext):
+    now = datetime.now()
+    await safe_edit(callback.message, "Выберите день для настройки:", reply_markup=create_calendar(now.year, now.month))
+    await state.set_state(AdminState.custom_date)
+    await callback.answer()
+
+@dp.callback_query(AdminState.custom_date, F.data.startswith("cal_"))
+async def admin_custom_cal_nav(callback: CallbackQuery):
+    _, y, m = callback.data.split("_")
+    try: await callback.message.edit_reply_markup(reply_markup=create_calendar(int(y), int(m)))
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(AdminState.custom_date, F.data.startswith("date_"))
+async def admin_custom_date(callback: CallbackQuery, state: FSMContext):
+    date_str = callback.data.split("_")[1]
+    await state.update_data(custom_date=date_str)
+    
+    with get_db() as conn: sched = conn.execute("SELECT * FROM schedule WHERE date=?", (date_str,)).fetchone()
+    
+    status = "Рабочий" if sched and sched['is_working'] else "Выходной"
+    time_info = f"{sched['start_time']} - {sched['end_time']}" if sched and sched['is_working'] else "—"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сделать выходным", callback_data="set_dayoff")],
+        [InlineKeyboardButton(text="Изменить часы работы", callback_data="set_custom_hours")],
+        [InlineKeyboardButton(text="Отмена", callback_data="cancel_action")]
+    ])
+    await safe_edit(callback.message, f"День: {date_str}\nСтатус: {status}\nВремя: {time_info}", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "set_dayoff")
+async def admin_set_dayoff(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    date_str = data['custom_date']
+    with get_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO schedule (date, start_time, end_time, is_working) VALUES (?, '00:00', '00:00', 0)", (date_str,))
+        # Удаляем старые блокировки, если они есть
+        conn.execute("DELETE FROM time_blocks WHERE date=?", (date_str,))
+    await safe_edit(callback.message, f"День {date_str} сделан выходным.", reply_markup=None)
+    await callback.message.answer("Готово.", reply_markup=get_admin_reply_kb())
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(F.data == "set_custom_hours")
+async def admin_set_custom_hours(callback: CallbackQuery, state: FSMContext):
+    await safe_edit(callback.message, "Введите время начала работы (ЧЧ:ММ):")
+    await state.set_state(AdminState.custom_start)
+    await callback.answer()
+
+@dp.message(AdminState.custom_start)
+async def admin_custom_start(message: Message, state: FSMContext):
+    if not validate_time(message.text): return await message.answer("Неверный формат. Введите ЧЧ:ММ:")
+    await state.update_data(c_start=message.text)
+    await message.answer("Введите время конца работы (ЧЧ:ММ):")
+    await state.set_state(AdminState.custom_end)
+
+@dp.message(AdminState.custom_end)
+async def admin_custom_end(message: Message, state: FSMContext):
+    if not validate_time(message.text): return await message.answer("Неверный формат. Введите ЧЧ:ММ:")
+    data = await state.get_data()
+    with get_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO schedule (date, start_time, end_time, is_working) VALUES (?, ?, ?, 1)", 
+                     (data['custom_date'], data['c_start'], message.text))
+    await message.answer(f"График на {data['custom_date']} установлен: {data['c_start']} - {message.text}.", reply_markup=get_admin_reply_kb())
+    await state.clear()
+
+# ==========================================
+# 9. АДМИН: УСЛУГИ
+# ==========================================
+@dp.message(F.text == "Услуги")
+async def msg_admin_services(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    with get_db() as conn: services = conn.execute("SELECT * FROM services").fetchall()
+    
+    await message.answer("Ваши услуги:")
+    for s in services:
+        status = "Активна" if s['is_active'] else "Скрыта"
+        text = f"{s['name']}\n{s['description']}\n{s['duration']} мин / {s['price']} руб. ({status})"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Изменить", callback_data=f"editsrv_{s['id']}"),
+             InlineKeyboardButton(text="Удалить", callback_data=f"delsrv_{s['id']}")]
+        ])
+        await message.answer(text, reply_markup=kb)
+    
+    await message.answer("Добавить новую услугу:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Создать услугу", callback_data="newsrv")]]))
+
+@dp.callback_query(F.data == "newsrv")
+async def admin_new_service(callback: CallbackQuery, state: FSMContext):
+    await safe_edit(callback.message, "Введите название услуги:")
+    await state.set_state(AdminState.srv_name)
+    await callback.answer()
+
+@dp.message(AdminState.srv_name)
+async def admin_srv_name(message: Message, state: FSMContext):
+    await state.update_data(sname=message.text)
+    await message.answer("Введите описание:")
+    await state.set_state(AdminState.srv_desc)
+
+@dp.message(AdminState.srv_desc)
+async def admin_srv_desc(message: Message, state: FSMContext):
+    await state.update_data(sdesc=message.text)
+    await message.answer("Введите длительность в минутах (число):")
+    await state.set_state(AdminState.srv_dur)
+
+@dp.message(AdminState.srv_dur)
+async def admin_srv_dur(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("Введите число!")
+    await state.update_data(sdur=int(message.text))
+    await message.answer("Введите цену (число):")
+    await state.set_state(AdminState.srv_price)
+
+@dp.message(AdminState.srv_price)
+async def admin_srv_price(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("Введите число!")
+    data = await state.get_data()
+    with get_db() as conn:
+        conn.execute("INSERT INTO services (name, description, duration, price) VALUES (?, ?, ?, ?)",
+                     (data['sname'], data['sdesc'], data['sdur'], int(message.text)))
+    await message.answer("Услуга добавлена.", reply_markup=get_admin_reply_kb())
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("delsrv_"))
+async def admin_del_service(callback: CallbackQuery):
+    srv_id = int(callback.data.split("_")[1])
+    with get_db() as conn:
+        conn.execute("DELETE FROM services WHERE id=?", (srv_id,))
+    await safe_edit(callback.message, "Услуга удалена.", reply_markup=None)
+    await callback.answer("Удалено")
+
+@dp.callback_query(F.data.startswith("editsrv_"))
+async def admin_edit_service(callback: CallbackQuery, state: FSMContext):
+    srv_id = int(callback.data.split("_")[1])
+    with get_db() as conn: srv = conn.execute("SELECT * FROM services WHERE id=?", (srv_id,)).fetchone()
+    
+    await state.update_data(edit_id=srv_id)
+    await safe_edit(callback.message, f"Редактирование: {srv['name']}\nВведите новое название (или отправьте текущее):")
+    await state.set_state(AdminState.edit_srv_name)
+    await callback.answer()
+
+@dp.message(AdminState.edit_srv_name)
+async def admin_edit_srv_name(message: Message, state: FSMContext):
+    await state.update_data(sname=message.text)
+    await message.answer("Введите новое описание:")
+    await state.set_state(AdminState.edit_srv_desc)
+
+@dp.message(AdminState.edit_srv_desc)
+async def admin_edit_srv_desc(message: Message, state: FSMContext):
+    await state.update_data(sdesc=message.text)
+    await message.answer("Введите новую длительность (мин):")
+    await state.set_state(AdminState.edit_srv_dur)
+
+@dp.message(AdminState.edit_srv_dur)
+async def admin_edit_srv_dur(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("Введите число!")
+    await state.update_data(sdur=int(message.text))
+    await message.answer("Введите новую цену:")
+    await state.set_state(AdminState.edit_srv_price)
+
+@dp.message(AdminState.edit_srv_price)
+async def admin_edit_srv_price(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("Введите число!")
+    data = await state.get_data()
+    with get_db() as conn:
+        conn.execute("UPDATE services SET name=?, description=?, duration=?, price=? WHERE id=?",
+                     (data['sname'], data['sdesc'], data['sdur'], int(message.text), data['edit_id']))
+    await message.answer("Услуга обновлена.", reply_markup=get_admin_reply_kb())
+    await state.clear()
+
+# ==========================================
+# 10. АДМИН: ОСТАЛЬНОЕ (На сегодня, Ручная, Клиенты, Настройки)
 # ==========================================
 @dp.message(F.text == "На сегодня")
 async def msg_admin_today(message: Message):
@@ -434,99 +664,8 @@ async def msg_admin_today(message: Message):
     text = f"Записи на сегодня ({today}):\n\n"
     for b in bks:
         text += f"{b['start_time']} - {b['srv_name']}\nКлиент: {b['client_name']} ({b['client_phone']})\n\n"
-    
     await message.answer(text)
 
-@dp.message(F.text == "Настройки")
-async def msg_admin_settings(message: Message):
-    if message.from_user.id != ADMIN_ID: return
-    await message.answer("Дополнительные настройки:", reply_markup=get_admin_inline_menu())
-
-# --- СТАТИСТИКА ---
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: CallbackQuery):
-    with get_db() as conn:
-        # Выручка за текущий месяц (по завершенным)
-        month_start = datetime.now().replace(day=1).strftime("%d.%m.%Y")
-        rev = conn.execute("SELECT SUM(price_paid) FROM bookings WHERE status='completed' AND date >= ?", (month_start,)).fetchone()[0]
-        rev = rev if rev else 0
-        
-        # Количество записей (всего за месяц)
-        total = conn.execute("SELECT COUNT(*) FROM bookings WHERE date >= ?", (month_start,)).fetchone()[0]
-        
-        # Популярные услуги
-        pop = conn.execute("""SELECT s.name, COUNT(b.id) as c FROM bookings b JOIN services s ON b.service_id=s.id 
-                              WHERE b.date >= ? GROUP BY s.id ORDER BY c DESC LIMIT 3""", (month_start,)).fetchall()
-    
-    text = f"Статистика за текущий месяц:\n\n"
-    text += f"Выручка: {rev} руб.\n"
-    text += f"Всего записей: {total}\n\n"
-    text += "Топ услуг:\n"
-    for p in pop: text += f"- {p['name']} ({p['c']} шт.)\n"
-    
-    await safe_edit(callback.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Закрыть", callback_data="cancel_action")]]))
-    await callback.answer()
-
-# --- УПРАВЛЕНИЕ УСЛУГАМИ ---
-@dp.callback_query(F.data == "admin_services")
-async def admin_services(callback: CallbackQuery):
-    with get_db() as conn: services = conn.execute("SELECT * FROM services").fetchall()
-    
-    text = "Список услуг (нажмите для ВКЛ/ВЫКЛ):\n\n"
-    kb = []
-    for s in services:
-        status = "+" if s['is_active'] else "-"
-        kb.append([InlineKeyboardButton(text=f"[{status}] {s['name']} - {s['price']}р", callback_data=f"toggsrv_{s['id']}")])
-    
-    kb.append([InlineKeyboardButton(text="Добавить услугу", callback_data="newsrv")])
-    kb.append([InlineKeyboardButton(text="Назад", callback_data="cancel_action")])
-    await safe_edit(callback.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("toggsrv_"))
-async def admin_toggle_service(callback: CallbackQuery):
-    srv_id = int(callback.data.split("_")[1])
-    with get_db() as conn:
-        conn.execute("UPDATE services SET is_active = 1 - is_active WHERE id=?", (srv_id,))
-    await callback.answer("Статус обновлен.", show_alert=True)
-    await admin_services(callback) 
-
-@dp.callback_query(F.data == "newsrv")
-async def admin_new_service(callback: CallbackQuery, state: FSMContext):
-    await safe_edit(callback.message, "Введите название услуги:")
-    await state.set_state(AdminState.service_name)
-    await callback.answer()
-
-@dp.message(AdminState.service_name)
-async def admin_service_name(message: Message, state: FSMContext):
-    await state.update_data(sname=message.text)
-    await message.answer("Введите описание:")
-    await state.set_state(AdminState.service_desc)
-
-@dp.message(AdminState.service_desc)
-async def admin_service_desc(message: Message, state: FSMContext):
-    await state.update_data(sdesc=message.text)
-    await message.answer("Введите длительность в минутах (число):")
-    await state.set_state(AdminState.service_duration)
-
-@dp.message(AdminState.service_duration)
-async def admin_service_duration(message: Message, state: FSMContext):
-    if not message.text.isdigit(): return await message.answer("Введите число!")
-    await state.update_data(sdur=int(message.text))
-    await message.answer("Введите цену (число):")
-    await state.set_state(AdminState.service_price)
-
-@dp.message(AdminState.service_price)
-async def admin_service_price(message: Message, state: FSMContext):
-    if not message.text.isdigit(): return await message.answer("Введите число!")
-    data = await state.get_data()
-    with get_db() as conn:
-        conn.execute("INSERT INTO services (name, description, duration, price) VALUES (?, ?, ?, ?)",
-                     (data['sname'], data['sdesc'], data['sdur'], int(message.text)))
-    await message.answer("Услуга добавлена.", reply_markup=get_admin_reply_kb())
-    await state.clear()
-
-# --- РУЧНАЯ ЗАПИСЬ ---
 @dp.message(F.text == "Ручная запись")
 async def admin_manual_start(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
@@ -571,7 +710,7 @@ async def admin_manual_date(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     with get_db() as conn: srv = conn.execute("SELECT duration FROM services WHERE id=?", (data['srv_id'],)).fetchone()
     slots = get_available_slots(date_str, srv['duration'])
-    if not slots: return await callback.answer("Нет мест.", show_alert=True)
+    if not slots: return await callback.answer("В этот день выходной или нет мест.", show_alert=True)
     
     kb = []
     row = []
@@ -592,45 +731,13 @@ async def admin_manual_time(callback: CallbackQuery, state: FSMContext):
     with get_db() as conn:
         srv = conn.execute("SELECT * FROM services WHERE id=?", (data['srv_id'],)).fetchone()
         end_time = min_to_time(time_to_min(time_str) + srv['duration'])
-        conn.execute("INSERT INTO bookings (client_id, client_name, client_phone, service_id, date, start_time, end_time, status, price_paid) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)",
-                     (0, data['name'], data['phone'], srv['id'], data['date'], time_str, end_time, srv['price']))
+        conn.execute("INSERT INTO bookings (client_id, client_name, client_phone, service_id, date, start_time, end_time, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'active')",
+                     (0, data['name'], data['phone'], srv['id'], data['date'], time_str, end_time))
     await safe_edit(callback.message, f"Клиент {data['name']} добавлен на {data['date']} в {time_str}.", reply_markup=None)
-    await callback.message.answer("Главное меню:", reply_markup=get_admin_reply_kb())
+    await callback.message.answer("Готово.", reply_markup=get_admin_reply_kb())
     await state.clear()
     await callback.answer()
 
-# --- БЛОКИРОВКА ВРЕМЕНИ ---
-@dp.callback_query(F.data == "admin_block")
-async def admin_block_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID: return
-    await safe_edit(callback.message, "Введите дату блокировки (ДД.ММ.ГГГГ):")
-    await state.set_state(AdminState.block_date)
-    await callback.answer()
-
-@dp.message(AdminState.block_date)
-async def admin_block_date(message: Message, state: FSMContext):
-    if not validate_date(message.text): return await message.answer("Неверный формат. Введите ДД.ММ.ГГГГ:")
-    await state.update_data(block_date=message.text)
-    await message.answer("Введите время начала (ЧЧ:ММ):")
-    await state.set_state(AdminState.block_start)
-
-@dp.message(AdminState.block_start)
-async def admin_block_start_time(message: Message, state: FSMContext):
-    if not validate_time(message.text): return await message.answer("Неверный формат. Введите ЧЧ:ММ:")
-    await state.update_data(block_start=message.text)
-    await message.answer("Введите время конца (ЧЧ:ММ):")
-    await state.set_state(AdminState.block_end)
-
-@dp.message(AdminState.block_end)
-async def admin_block_end_time(message: Message, state: FSMContext):
-    if not validate_time(message.text): return await message.answer("Неверный формат. Введите ЧЧ:ММ:")
-    data = await state.get_data()
-    with get_db() as conn:
-        conn.execute("INSERT INTO time_blocks (date, start_time, end_time) VALUES (?, ?, ?)", (data['block_date'], data['block_start'], message.text))
-    await message.answer("Время заблокировано для клиентов.", reply_markup=get_admin_reply_kb())
-    await state.clear()
-
-# --- КЛИЕНТЫ ---
 @dp.message(F.text == "Клиенты")
 async def admin_clients_msg(message: Message):
     if message.from_user.id != ADMIN_ID: return
@@ -676,16 +783,10 @@ async def admin_add_note_save(message: Message, state: FSMContext):
     await message.answer("Заметка сохранена.", reply_markup=get_admin_reply_kb())
     await state.clear()
 
-# --- ПРОМОКОДЫ И РАССЫЛКА ---
-@dp.callback_query(F.data == "admin_settings")
-async def admin_settings_extra(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Создать промокод", callback_data="admin_new_promo")],
-        [InlineKeyboardButton(text="Рассылка клиентам", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="Закрыть", callback_data="cancel_action")]
-    ])
-    await safe_edit(callback.message, "Дополнительные настройки:", reply_markup=kb)
-    await callback.answer()
+@dp.message(F.text == "Настройки")
+async def msg_admin_settings(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer("Дополнительные настройки:", reply_markup=get_admin_inline_menu())
 
 @dp.callback_query(F.data == "admin_new_promo")
 async def admin_new_promo(callback: CallbackQuery, state: FSMContext):
@@ -734,7 +835,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
     await state.clear()
 
 # ==========================================
-# 8. ФОНОВЫЕ ЗАДАЧИ
+# 11. ФОНОВЫЕ ЗАДАЧИ И ЗАПУСК
 # ==========================================
 async def reminder_worker():
     while True:
@@ -743,30 +844,11 @@ async def reminder_worker():
             with get_db() as conn:
                 bks = conn.execute("SELECT * FROM bookings WHERE date=? AND status='active' AND client_id > 0", (tomorrow,)).fetchall()
             for b in bks:
-                try: await bot.send_message(b['client_id'], f"Напоминание.\nЗавтра в {b['start_time']} у вас запись.\nАдрес: {BARBER_ADDRESS}")
+                try: await bot.send_message(b['client_id'], f"Напоминание.\nЗавтра в {b['start_time']} у вас запись к мастеру {BARBER_NAME}.\nАдрес: {BARBER_ADDRESS}")
                 except: pass
         except Exception as e: logging.error(f"Reminder: {e}")
         await asyncio.sleep(3600)
 
-async def report_worker():
-    last_report_date = None
-    while True:
-        now = datetime.now()
-        today = now.strftime("%d.%m.%Y")
-        if now.hour == 20 and now.minute == 0 and last_report_date != today:
-            last_report_date = today
-            with get_db() as conn:
-                res = conn.execute("SELECT status, COUNT(*) as c FROM bookings WHERE date=? GROUP BY status", (today,)).fetchall()
-            text = f"Отчет за {today}:\n"
-            for r in res: text += f"{r['status']}: {r['c']}\n"
-            if not res: text += "Записей не было."
-            try: await bot.send_message(ADMIN_ID, text)
-            except: pass
-        await asyncio.sleep(30)
-
-# ==========================================
-# 9. ЗАПУСК
-# ==========================================
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="OK"))
@@ -777,7 +859,6 @@ async def start_web_server():
 async def main():
     asyncio.create_task(start_web_server())
     asyncio.create_task(reminder_worker())
-    asyncio.create_task(report_worker())
     logging.info("CRM Бот запущен.")
     await dp.start_polling(bot)
 
